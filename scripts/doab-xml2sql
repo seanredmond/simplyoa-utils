@@ -1,0 +1,226 @@
+#!/usr/bin/env ruby
+
+require 'nokogiri'
+require 'optparse'
+require 'pp'
+
+Marc100 = Struct.new(:marc) do
+  def ind1
+    marc['ind1']
+  end
+
+  def name
+    marc.css('subfield[code="a"]').first.text
+  end
+
+  def relationship
+    marc.css('subfield[code="4"]').first.text
+  end
+end
+
+MarcField = Struct.new(:marc) do
+  def ind1
+    marc['ind1']
+  end
+
+  def ind2
+    marc['ind2']
+  end
+
+  def subfield(code)
+    marc.css("subfield[code=\"%s\"]" % [code])
+  end
+
+  def subfield_text(code)
+    subfield(code).map{|s| s.text}
+  end
+end  
+
+class ElecLoc < MarcField
+  def type
+    return {
+      '#' => 'No information provided',
+      '0' => 'Email',
+      '1' => 'FTP',
+      '2' => 'Remote login (Telnet)',
+      '3' => 'Dial-up',
+      '4' => 'HTTP'
+    }[ind1]
+  end
+
+  def uris
+    subfield_text('u')
+  end
+
+  def public_note
+    subfield_text('z')
+  end
+end
+
+Book = Struct.new(:identifier, :oai, :marc) do
+  def id
+    identifier.split(':').last.to_i
+  end
+
+  def first_of(tag, fmt)
+    t = fmt.css(tag)
+    if t.empty?
+      return nil
+    end
+    t.first.text
+  end
+
+  def title
+    first_of('title', oai)
+  end
+
+  def date
+    first_of('date', oai)
+  end
+
+  def updated
+    first_of('datestamp', oai)
+  end
+
+  def datafield(tag)
+    marc.css("datafield[tag=\"%s\"]" % [tag])
+  end
+  
+  def m100
+    # Some parsing problem or something was leading to empty nodes?
+    marc.css('datafield[tag="100"]').map{|a| Marc100.new(a)}.
+      reject{|a| a.name.empty?}
+  end
+
+  def urls
+    datafield("856").map{|f| ElecLoc.new(f)}
+  end
+
+  def isbns
+    marc.css('datafield[tag="020"] subfield[code="a"]').map{|i| i.text}
+  end
+
+  def deleted?
+    oai.css('header').first['status'] == 'deleted'
+  end
+
+  def license
+    first_of('right', oai)
+  end
+
+  def language
+    begin
+      MarcField.new(datafield("546").first).subfield_text('a').first
+    rescue NoMethodError
+      return nil
+    end
+  end
+
+  def pubid
+    oai.css('setSpec').select{|s| s.text =~ /\Apublisher_/}.first.text.split('_').last.to_i
+  end
+end
+
+def xmlpath(dir, id, fmt)
+  File.expand_path(File.join(dir, id, "%s.%s.xml" % [id, fmt]))
+end
+
+def marcpath(dir, id)
+  xmlpath(dir, id, 'marc')
+end
+
+def oaipath(dir, id)
+  xmlpath(dir, id, 'oai')
+end
+
+def get_pub(pubid, datadir)
+  marc = File.open(marcpath(datadir, pubid)) {
+    |f| Nokogiri::XML(f)
+  }
+  oai = File.open(oaipath(datadir, pubid)) {
+    |f| Nokogiri::XML(f)
+  }
+
+  marc.remove_namespaces!
+  oai.remove_namespaces!
+
+  get_books(marc, oai).each do |book|
+    if book.deleted?
+      next
+    end
+
+    puts """INSERT INTO books (doab_id, title, year, pub_id, language, license, updated) 
+    VALUES (%d, '%s', '%s', %d, %s, '%s', '%s');""" %
+         [book.id, qesc(book.title), book.date, book.pubid, nullish(book.language), book.license, book.updated]
+
+    book.isbns.each do |isbn|
+      puts """INSERT INTO book_isbns (doab_id, isbn)
+    VALUES (%d, '%s');""" % [book.id, isbn]
+    end
+
+    book.m100.each do |a|
+      puts """INSERT OR IGNORE INTO authors (name, type) 
+    VALUES ('%s', '%s');""" % [a.name, a.ind1]
+      puts """INSERT INTO book2auth (book_id, author, rel)
+    VALUES (%d, '%s', '%s');""" % [book.id, qesc(a.name), a.relationship]
+    end
+
+    book.urls.each do |u|
+      u.uris.each do |uri|
+        puts """INSERT OR IGNORE INTO book2url (book_id, url)
+    VALUES (%d, '%s');""" % [book.id, uri]
+      end
+    end
+  end
+end  
+
+def get_books(marc, oai)
+  from_oai = Hash[oai.css('record').map{|r| [r.css('header identifier').first.text, r]}]
+  from_marc = Hash[marc.css('ListRecords > record').map{|r| [r.css('header identifier').first.text, r]}]
+
+  if (from_oai.keys - from_marc.keys | from_marc.keys - from_oai.keys).
+      count > 0
+    Raise "Mismatched IDS"
+  end
+
+  from_oai.keys.map{|b| Book.new(b, from_oai[b], from_marc[b])}
+end
+
+# escape quotes for sql
+def qesc(s)
+  s.gsub("'", "''")
+end
+
+def nullish(s)
+  if s.nil?
+    return 'NULL'
+  end
+
+  return "'%s'" % [qesc(s)]
+end
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: example.rb [options]"
+
+  opts.on("-d", "--datadir DATADIR", "Director where publisher metadata files are located") do |d|
+    options[:datadir] = d
+  end
+
+  opts.on("-", "--pubid PUBID", "ID of publisher files to parse") do |p|
+    options[:pubid] = p
+  end
+end.parse!
+
+
+if options[:pubid].nil?
+  Dir[File.expand_path(File.join(options[:datadir], '*'))].each do |d|
+    if File.directory? d
+      pubid = d.split(File::SEPARATOR).last
+      STDERR.puts "Reading %s..." % [pubid]
+      get_pub(pubid, options[:datadir])
+    end
+  end
+else
+  get_pub(options[:pubid], options[:datadir])
+end

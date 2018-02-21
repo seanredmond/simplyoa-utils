@@ -1,0 +1,110 @@
+#!/usr/bin/env ruby
+
+# Download and save metadata from doabooks.org
+
+require 'nokogiri'
+require 'open-uri'
+require 'optparse'
+
+DOAB_SETS = "https://www.doabooks.org/oai?verb=ListSets"
+
+Publisher = Struct.new(:name, :spec) do
+  def records(pub, fmt)
+    "https://www.doabooks.org/oai?verb=ListRecords&set=%s&metadataPrefix=%s" % [pub, fmt]
+  end
+
+  def id
+    if spec =~ /publisher_(\d+)/
+      return $1
+    end
+
+    raise "Couldn't parse publisher spec"
+  end
+
+  def oai
+    records spec, 'oai_dc'
+  end
+
+  def marc
+    records spec, 'marcxml'
+  end
+
+  def dir(dest)
+    File.expand_path(File.join(dest, id))
+  end
+
+  def fn(dest, fmt)
+    File.expand_path(File.join(dest, id, "%s.%s.xml" % [id, fmt]))
+  end
+
+  def oai_fn(dest)
+    fn(dest, 'oai')
+  end
+
+  def marc_fn(dest)
+    fn(dest, 'marc')
+  end
+end
+
+
+def get_publishers
+  pubs = Nokogiri::XML(open(DOAB_SETS))
+  pubs.remove_namespaces!
+
+  pub_list = []
+  pubs.css('set').each do |set|
+    spec = set.css('setSpec').first.text
+    name = set.css('setName').first.text
+
+    if spec[0..8] == 'publisher'
+      pub_list << Publisher.new(name, spec)
+    end
+  end
+  
+  return pub_list
+end
+
+# escape quotes for sql
+def qesc(s)
+  s.gsub("'", "''")
+end
+  
+
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: example.rb [options]"
+
+  opts.on("-d", "--dest DESTINATION", "Destination for downloaded files") do |d|
+    options[:dest] = d
+  end
+
+end.parse!
+options[:xml] = true
+
+publishers = get_publishers
+STDERR.puts "Found %d publishers" % [publishers.count]
+
+STDERR.puts "DEST"
+STDERR.puts options[:dest]
+pubsql = File.open(File.expand_path(
+                    File.join(options[:dest], 'publishers.sql')), 'w')
+
+publishers.each do |pub|
+  STDERR.puts "Fetching %s..." % [pub.name]
+
+  if options[:xml]
+    Dir.mkdir(pub.dir(options[:dest]))
+
+    # Fetch and save OAI_DC metadata
+    oai = open(pub.oai)
+    IO.copy_stream(oai, pub.oai_fn(options[:dest]))
+
+    # Fetch and save MARCXML metadata
+    marc = open(pub.marc)
+    IO.copy_stream(marc, pub.marc_fn(options[:dest]))
+  end
+
+  pubsql.puts """INSERT OR REPLACE INTO publishers (doab_id, publisher) 
+    VALUES (%d, '%s');""" % [pub.id, qesc(pub.name)]
+end
